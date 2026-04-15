@@ -40,6 +40,10 @@ const COUNTRY_NAMES = {
   23: 'كردستان',
 };
 
+const FOLLOW_POINTS = 3;
+const SHARE_THRESHOLD = 5;
+const LIKE_THRESHOLD = 200;
+
 let nextEventId = 1;
 const rooms = new Map();
 
@@ -67,6 +71,7 @@ function createRoom(roomCode) {
     viewerFlagMap: new Map(),
     pendingLikesByFlag: new Map(),
     pendingSharesByFlag: new Map(),
+    followedUsers: new Set(),
     events: [],
     stats: {
       joins: 0,
@@ -172,6 +177,7 @@ async function connectRoomToTikTok(room, username) {
   room.viewerFlagMap.clear();
   room.pendingLikesByFlag.clear();
   room.pendingSharesByFlag.clear();
+  room.followedUsers.clear();
   room.username = uniqueId;
   room.connecting = true;
   room.updatedAt = now();
@@ -222,9 +228,16 @@ async function connectRoomToTikTok(room, username) {
       const flagNumber = room.viewerFlagMap.get(userId);
       if (!flagNumber) return;
 
+      // يعطي نقاط متابعة مرة واحدة فقط لكل مستخدم داخل نفس الغرفة
+      if (room.followedUsers.has(userId)) {
+        return;
+      }
+
+      room.followedUsers.add(userId);
       room.stats.follows += 1;
-      emitPoints(room, 'follow', uniqueId2, flagNumber, 25);
-      emitFeed(room, 'support', `${uniqueId2} دعم ${getCountryName(flagNumber)} بمتابعة +25`, {
+
+      emitPoints(room, 'follow', uniqueId2, flagNumber, FOLLOW_POINTS);
+      emitFeed(room, 'support', `${uniqueId2} دعم ${getCountryName(flagNumber)} بمتابعة +${FOLLOW_POINTS}`, {
         uniqueId: uniqueId2,
         flagNumber,
         country: getCountryName(flagNumber),
@@ -243,7 +256,7 @@ async function connectRoomToTikTok(room, username) {
 
       room.stats.shares += 1;
       addToMapCounter(room.pendingSharesByFlag, flagNumber, 1);
-      const points = consumeThreshold(room.pendingSharesByFlag, flagNumber, 5);
+      const points = consumeThreshold(room.pendingSharesByFlag, flagNumber, SHARE_THRESHOLD);
       if (points > 0) {
         emitPoints(room, 'share', uniqueId2, flagNumber, points);
         emitFeed(room, 'support', `${uniqueId2} دعم ${getCountryName(flagNumber)} بالشير +${points}`, {
@@ -267,7 +280,7 @@ async function connectRoomToTikTok(room, username) {
       const likeCount = Number(data.likeCount || 1);
       room.stats.likes += likeCount;
       addToMapCounter(room.pendingLikesByFlag, flagNumber, likeCount);
-      const points = consumeThreshold(room.pendingLikesByFlag, flagNumber, 200);
+      const points = consumeThreshold(room.pendingLikesByFlag, flagNumber, LIKE_THRESHOLD);
       if (points > 0) {
         emitPoints(room, 'like', uniqueId2, flagNumber, points, { rawLikeCount: likeCount });
         emitFeed(room, 'support', `${uniqueId2} دعم ${getCountryName(flagNumber)} باللايك +${points}`, {
