@@ -1,0 +1,14 @@
+{
+  "name": "tiktok-hosted-bridge-v1",
+  "version": "1.0.0",
+  "private": true,
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "tiktok-live-connector": "^1.2.3"
+  }
+}
