@@ -40,9 +40,8 @@ const COUNTRY_NAMES = {
   23: 'كردستان',
 };
 
-const FOLLOW_POINTS = 3;
-const SHARE_THRESHOLD = 5;
-const LIKE_THRESHOLD = 200;
+const FOLLOW_POINTS = 5;
+const LIKE_THRESHOLD = 30;
 
 let nextEventId = 1;
 const rooms = new Map();
@@ -250,21 +249,11 @@ async function connectRoomToTikTok(room, username) {
   connection.on('share', (data) => {
     try {
       const userId = String(data.userId || data.uniqueId || '');
-      const uniqueId2 = String(data.uniqueId || 'unknown');
       const flagNumber = room.viewerFlagMap.get(userId);
       if (!flagNumber) return;
 
+      // الشير لا يعطي نقاط حالياً، فقط نسجل الإحصائية
       room.stats.shares += 1;
-      addToMapCounter(room.pendingSharesByFlag, flagNumber, 1);
-      const points = consumeThreshold(room.pendingSharesByFlag, flagNumber, SHARE_THRESHOLD);
-      if (points > 0) {
-        emitPoints(room, 'share', uniqueId2, flagNumber, points);
-        emitFeed(room, 'support', `${uniqueId2} دعم ${getCountryName(flagNumber)} بالشير +${points}`, {
-          uniqueId: uniqueId2,
-          flagNumber,
-          country: getCountryName(flagNumber),
-        });
-      }
     } catch (err) {
       console.error('share handler error', err);
     }
