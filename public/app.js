@@ -5,6 +5,7 @@ const stopBtn = document.getElementById('stopBtn');
 const statusEl = document.getElementById('status');
 
 function setStatus(text, isError = false) {
+  if (!statusEl) return;
   statusEl.textContent = text;
   statusEl.style.color = isError ? '#ff8a8a' : '#9fd3ff';
 }
@@ -24,7 +25,10 @@ async function fetchRoomStatus(roomCode) {
   }
 
   try {
-    const res = await fetch(`/api/room/status?roomCode=${encodeURIComponent(roomCode)}`);
+    const res = await fetch(`/api/room/status?roomCode=${encodeURIComponent(roomCode)}`, {
+      cache: 'no-store',
+    });
+
     const data = await res.json();
 
     if (!data.ok) {
@@ -42,17 +46,17 @@ async function fetchRoomStatus(roomCode) {
 
     return data;
   } catch (err) {
-    setStatus('تعذر الاتصال بالسيرفر', true);
+    setStatus('Failed to retrieve the initial room data', true);
     return null;
   }
 }
 
 async function startLink() {
-  const roomCode = normalizeRoomCode(roomCodeInput.value);
-  const username = normalizeUsername(usernameInput.value);
+  const roomCode = normalizeRoomCode(roomCodeInput?.value);
+  const username = normalizeUsername(usernameInput?.value);
 
-  roomCodeInput.value = roomCode;
-  usernameInput.value = username;
+  if (roomCodeInput) roomCodeInput.value = roomCode;
+  if (usernameInput) usernameInput.value = username;
 
   if (!roomCode) {
     setStatus('اكتب كود الغرفة', true);
@@ -90,8 +94,8 @@ async function startLink() {
 }
 
 async function stopLink() {
-  const roomCode = normalizeRoomCode(roomCodeInput.value);
-  roomCodeInput.value = roomCode;
+  const roomCode = normalizeRoomCode(roomCodeInput?.value);
+  if (roomCodeInput) roomCodeInput.value = roomCode;
 
   if (!roomCode) {
     setStatus('اكتب كود الغرفة أولاً', true);
@@ -123,20 +127,22 @@ async function stopLink() {
   }
 }
 
-startBtn.addEventListener('click', startLink);
-stopBtn.addEventListener('click', stopLink);
+if (startBtn) startBtn.addEventListener('click', startLink);
+if (stopBtn) stopBtn.addEventListener('click', stopLink);
 
-roomCodeInput.addEventListener('change', () => {
-  roomCodeInput.value = normalizeRoomCode(roomCodeInput.value);
-  fetchRoomStatus(roomCodeInput.value);
-});
-
-roomCodeInput.addEventListener('blur', () => {
-  roomCodeInput.value = normalizeRoomCode(roomCodeInput.value);
-  if (roomCodeInput.value) {
+if (roomCodeInput) {
+  roomCodeInput.addEventListener('change', () => {
+    roomCodeInput.value = normalizeRoomCode(roomCodeInput.value);
     fetchRoomStatus(roomCodeInput.value);
-  }
-});
+  });
+
+  roomCodeInput.addEventListener('blur', () => {
+    roomCodeInput.value = normalizeRoomCode(roomCodeInput.value);
+    if (roomCodeInput.value) {
+      fetchRoomStatus(roomCodeInput.value);
+    }
+  });
+}
 
 window.addEventListener('load', () => {
   setStatus('جاهز');
