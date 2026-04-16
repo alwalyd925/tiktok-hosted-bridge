@@ -184,7 +184,7 @@ async function connectRoomToTikTok(room, username) {
   const connection = new WebcastPushConnection(uniqueId, {
     processInitialData: false,
     enableExtendedGiftInfo: false,
-    fetchRoomInfoOnConnect: true,
+    fetchRoomInfoOnConnect: false,
   });
 
   room.connection = connection;
@@ -385,9 +385,14 @@ app.post('/api/room/start', async (req, res) => {
     room.connected = false;
     room.connecting = false;
     pushEvent(room, 'system', { message: 'connectFailed', error: String(err?.message || err) });
+    const rawError = String(err?.message || err);
+    let friendlyError = rawError;
+    if (rawError.toLowerCase().includes('initial room data')) {
+      friendlyError = 'تعذر سحب بيانات البث من تيك توك الآن. جرّب مرة ثانية بعد ثوانٍ.';
+    }
     return res.status(500).json({
       ok: false,
-      error: String(err?.message || err),
+      error: friendlyError,
     });
   }
 });
