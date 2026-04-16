@@ -1,9 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { WebcastPushConnection } = require('tiktok-live-connector');
+const fs = require('fs');
 
 const app = express();
+
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -12,20 +13,13 @@ const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET || 'roblox_tiktok_easy_bridge_v1';
 const FLAG_COUNT = Number(process.env.FLAG_COUNT || 23);
 const MAX_EVENTS_PER_ROOM = 3000;
-const INACTIVE_ROOM_MS = 1000 * 60 * 60 * 6;
+const INACTIVE_ROOM_MS = 1000 * 60 * 60 * 6; // 6 hours
+const DATA_FILE = path.join(__dirname, 'rooms-data.json');
 
-const rooms = new Map();
+let rooms = new Map();
 
 function nowMs() {
   return Date.now();
-}
-
-function normalizeRoomCode(value) {
-  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 16);
-}
-
-function normalizeUsername(value) {
-  return String(value || '').trim().replace(/^@+/, '');
 }
 
 function makeRoom(roomCode) {
@@ -35,387 +29,364 @@ function makeRoom(roomCode) {
     updatedAt: nowMs(),
     nextEventId: 1,
     events: [],
-    userFlags: new Map(),       // userId -> flagNumber
-    totalLikesSeen: new Map(),  // userId -> total likes seen
-    likeRemainders: new Map(),  // userId -> remainder likes not yet converted to points
-    followedUsers: new Set(),   // userIds already rewarded for follow
-    linkedUsername: '',
-    connected: false,
-    connecting: false,
-    lastError: '',
-    connection: null,
+    userFlags: new Map(),
+    lastLikeTotal: new Map(),
+    likeBuckets: new Map(),
+    followedUsers: new Set(),
   };
 }
 
+function serializeRoom(room) {
+  return {
+    roomCode: room.roomCode,
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+    nextEventId: room.nextEventId,
+    events: room.events,
+    userFlags: Array.from(room.userFlags.entries()),
+    lastLikeTotal: Array.from(room.lastLikeTotal.entries()),
+    likeBuckets: Array.from(room.likeBuckets.entries()),
+    followedUsers: Array.from(room.followedUsers.values()),
+  };
+}
+
+function deserializeRoom(raw) {
+  return {
+    roomCode: raw.roomCode,
+    createdAt: Number(raw.createdAt || nowMs()),
+    updatedAt: Number(raw.updatedAt || nowMs()),
+    nextEventId: Number(raw.nextEventId || 1),
+    events: Array.isArray(raw.events) ? raw.events : [],
+    userFlags: new Map(Array.isArray(raw.userFlags) ? raw.userFlags : []),
+    lastLikeTotal: new Map(Array.isArray(raw.lastLikeTotal) ? raw.lastLikeTotal : []),
+    likeBuckets: new Map(Array.isArray(raw.likeBuckets) ? raw.likeBuckets : []),
+    followedUsers: new Set(Array.isArray(raw.followedUsers) ? raw.followedUsers : []),
+  };
+}
+
+function saveRooms() {
+  try {
+    const payload = {
+      savedAt: nowMs(),
+      rooms: Array.from(rooms.entries()).map(([roomCode, room]) => [roomCode, serializeRoom(room)]),
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(payload), 'utf8');
+  } catch (err) {
+    console.error('saveRooms failed:', err);
+  }
+}
+
+function loadRooms() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      return;
+    }
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const nextRooms = new Map();
+    for (const [roomCode, rawRoom] of Array.isArray(parsed.rooms) ? parsed.rooms : []) {
+      nextRooms.set(roomCode, deserializeRoom(rawRoom));
+    }
+    rooms = nextRooms;
+    console.log(`Loaded ${rooms.size} room(s) from disk`);
+  } catch (err) {
+    console.error('loadRooms failed:', err);
+  }
+}
+
 function getRoom(roomCode) {
-  const normalized = normalizeRoomCode(roomCode);
-  if (!normalized) return null;
+  const normalized = String(roomCode || '').trim().toUpperCase();
+  if (!normalized) {
+    return null;
+  }
 
   let room = rooms.get(normalized);
   if (!room) {
     room = makeRoom(normalized);
     rooms.set(normalized, room);
+    saveRooms();
   }
 
   room.updatedAt = nowMs();
   return room;
 }
 
+function cleanupRooms() {
+  const cutoff = nowMs() - INACTIVE_ROOM_MS;
+  let changed = false;
+  for (const [roomCode, room] of rooms.entries()) {
+    if (room.updatedAt < cutoff) {
+      rooms.delete(roomCode);
+      changed = true;
+    }
+  }
+  if (changed) {
+    saveRooms();
+  }
+}
+
 function pushEvent(room, event) {
-  const fullEvent = {
+  const finalEvent = {
     id: room.nextEventId++,
-    ts: Math.floor(Date.now() / 1000),
+    ts: nowMs(),
     ...event,
   };
 
-  room.events.push(fullEvent);
+  room.events.push(finalEvent);
   if (room.events.length > MAX_EVENTS_PER_ROOM) {
     room.events.splice(0, room.events.length - MAX_EVENTS_PER_ROOM);
   }
 
   room.updatedAt = nowMs();
-  return fullEvent;
+  saveRooms();
+  return finalEvent;
 }
 
-function getUserKey(data) {
-  return String(data?.uniqueId || data?.userId || data?.nickname || '').trim();
+function validFlagNumber(flagNumber) {
+  return Number.isInteger(flagNumber) && flagNumber >= 1 && flagNumber <= FLAG_COUNT;
 }
 
-function getDisplayUsername(data) {
-  return String(data?.uniqueId || data?.nickname || 'مستخدم');
+function normalizeUserId(body) {
+  return String(body.userId || body.username || body.nickname || '').trim();
 }
 
-function getDisplayNickname(data) {
-  return String(data?.nickname || data?.uniqueId || 'مستخدم');
+function normalizeString(value) {
+  return String(value || '').trim();
 }
 
-function disconnectRoom(room) {
-  if (room.connection) {
-    try {
-      room.connection.disconnect();
-    } catch (_) {}
-  }
-
-  room.connection = null;
-  room.connected = false;
-  room.connecting = false;
+function getDisplayName(body) {
+  return normalizeString(body.nickname) || normalizeString(body.username) || 'user';
 }
 
-function cleanupOldRooms() {
-  const cutoff = nowMs() - INACTIVE_ROOM_MS;
-  for (const [roomCode, room] of rooms) {
-    if (room.updatedAt < cutoff) {
-      disconnectRoom(room);
-      rooms.delete(roomCode);
-    }
+function awardPoints(room, body, points, source, extra = {}) {
+  if (!Number.isFinite(points) || points <= 0) {
+    return { ok: false, reason: 'bad_points' };
   }
+
+  const userId = normalizeUserId(body);
+  if (!userId) {
+    return { ok: false, reason: 'missing_user' };
+  }
+
+  const flagNumber = room.userFlags.get(userId);
+  if (!validFlagNumber(flagNumber)) {
+    return { ok: false, reason: 'user_not_joined' };
+  }
+
+  pushEvent(room, {
+    type: 'addPoints',
+    flagNumber,
+    points: Math.floor(points),
+    source,
+    userId,
+    username: normalizeString(body.username),
+    nickname: getDisplayName(body),
+    ...extra,
+  });
+
+  return { ok: true, flagNumber };
 }
 
-setInterval(cleanupOldRooms, 60 * 1000).unref?.();
-
-async function connectRoomToTikTok(room, username) {
-  username = normalizeUsername(username);
-  if (!username) {
-    throw new Error('Missing TikTok username');
+function handleJoinFlag(room, body) {
+  const userId = normalizeUserId(body);
+  if (!userId) {
+    return { ok: false, error: 'missing_user' };
   }
 
-  if (room.connecting) {
-    throw new Error('Connection already in progress');
+  const raw = normalizeString(body.commandParams || body.flagNumber);
+  const flagNumber = Number(raw);
+
+  if (!validFlagNumber(flagNumber)) {
+    return { ok: false, error: 'invalid_flag_number' };
   }
 
-  if (room.connected && room.linkedUsername === username) {
-    return {
-      ok: true,
-      alreadyConnected: true,
-      roomCode: room.roomCode,
-      username,
-    };
+  room.userFlags.set(userId, flagNumber);
+  room.updatedAt = nowMs();
+  saveRooms();
+
+  pushEvent(room, {
+    type: 'joinFlag',
+    flagNumber,
+    userId,
+    username: normalizeString(body.username),
+    nickname: getDisplayName(body),
+  });
+
+  return { ok: true, flagNumber };
+}
+
+function handleFollow(room, body) {
+  const userId = normalizeUserId(body);
+  if (!userId) {
+    return { ok: false, error: 'missing_user' };
   }
 
-  disconnectRoom(room);
-  room.connecting = true;
-  room.lastError = '';
-
-  const connection = new WebcastPushConnection(username, {
-    processInitialData: false,
-    enableExtendedGiftInfo: false,
-    fetchRoomInfoOnConnect: false,
-  });
-
-  room.connection = connection;
-
-  connection.on('chat', (data) => {
-    try {
-      const userKey = getUserKey(data);
-      if (!userKey) return;
-
-      const comment = String(data?.comment || '').trim();
-      if (!/^\d+$/.test(comment)) return;
-
-      const flagNumber = Number(comment);
-      if (flagNumber < 1 || flagNumber > FLAG_COUNT) return;
-
-      room.userFlags.set(userKey, flagNumber);
-      room.updatedAt = nowMs();
-
-      pushEvent(room, {
-        type: 'joinFlag',
-        flagNumber,
-        userId: userKey,
-        username: getDisplayUsername(data),
-        nickname: getDisplayNickname(data),
-      });
-    } catch (err) {
-      console.error('chat handler failed:', err);
-    }
-  });
-
-  connection.on('follow', (data) => {
-    try {
-      const userKey = getUserKey(data);
-      if (!userKey) return;
-      if (room.followedUsers.has(userKey)) return;
-
-      const flagNumber = room.userFlags.get(userKey);
-      if (!flagNumber) return;
-
-      room.followedUsers.add(userKey);
-      room.updatedAt = nowMs();
-
-      pushEvent(room, {
-        type: 'addPoints',
-        source: 'follow',
-        points: 5,
-        flagNumber,
-        userId: userKey,
-        username: getDisplayUsername(data),
-        nickname: getDisplayNickname(data),
-      });
-    } catch (err) {
-      console.error('follow handler failed:', err);
-    }
-  });
-
-  connection.on('like', (data) => {
-    try {
-      const userKey = getUserKey(data);
-      if (!userKey) return;
-
-      const flagNumber = room.userFlags.get(userKey);
-      if (!flagNumber) return;
-
-      const previousTotal = room.totalLikesSeen.get(userKey) || 0;
-      let deltaLikes = 0;
-
-      if (typeof data?.totalLikeCount === 'number') {
-        const totalLikeCount = Math.max(0, data.totalLikeCount);
-        deltaLikes = totalLikeCount >= previousTotal ? (totalLikeCount - previousTotal) : (data.likeCount || 0);
-        room.totalLikesSeen.set(userKey, totalLikeCount);
-      } else {
-        deltaLikes = Number(data?.likeCount || 0);
-        room.totalLikesSeen.set(userKey, previousTotal + deltaLikes);
-      }
-
-      if (deltaLikes <= 0) return;
-
-      const remainderBefore = room.likeRemainders.get(userKey) || 0;
-      const totalToConvert = remainderBefore + deltaLikes;
-      const points = Math.floor(totalToConvert / 30);
-      const remainderAfter = totalToConvert % 30;
-
-      room.likeRemainders.set(userKey, remainderAfter);
-      room.updatedAt = nowMs();
-
-      if (points <= 0) return;
-
-      pushEvent(room, {
-        type: 'addPoints',
-        source: 'like',
-        points,
-        flagNumber,
-        userId: userKey,
-        username: getDisplayUsername(data),
-        nickname: getDisplayNickname(data),
-        likeDelta: deltaLikes,
-      });
-    } catch (err) {
-      console.error('like handler failed:', err);
-    }
-  });
-
-  connection.on('gift', (data) => {
-    try {
-      const userKey = getUserKey(data);
-      if (!userKey) return;
-
-      const flagNumber = room.userFlags.get(userKey);
-      if (!flagNumber) return;
-
-      if (data?.giftType === 1 && !data?.repeatEnd) {
-        return;
-      }
-
-      const diamonds = Number(data?.diamondCount || 0);
-      const repeatCount = Number(data?.repeatCount || 1);
-      const points = Math.max(0, diamonds * repeatCount);
-      if (points <= 0) return;
-
-      room.updatedAt = nowMs();
-
-      pushEvent(room, {
-        type: 'addPoints',
-        source: 'gift',
-        points,
-        flagNumber,
-        userId: userKey,
-        username: getDisplayUsername(data),
-        nickname: getDisplayNickname(data),
-        giftName: String(data?.giftName || 'Gift'),
-      });
-    } catch (err) {
-      console.error('gift handler failed:', err);
-    }
-  });
-
-  connection.on('share', (_data) => {
-    room.updatedAt = nowMs();
-    // intentionally ignored (share = 0 points)
-  });
-
-  connection.on('disconnected', () => {
-    room.connected = false;
-    room.connecting = false;
-    room.updatedAt = nowMs();
-  });
-
-  connection.on('streamEnd', () => {
-    room.connected = false;
-    room.connecting = false;
-    room.updatedAt = nowMs();
-  });
-
-  try {
-    await connection.connect();
-    room.connected = true;
-    room.connecting = false;
-    room.linkedUsername = username;
-    room.updatedAt = nowMs();
-
-    return {
-      ok: true,
-      roomCode: room.roomCode,
-      username,
-      connected: true,
-    };
-  } catch (err) {
-    room.lastError = String(err?.message || err);
-    room.connected = false;
-    room.connecting = false;
-    disconnectRoom(room);
-    throw err;
+  if (room.followedUsers.has(userId)) {
+    return { ok: true, skipped: 'already_follow_rewarded' };
   }
+
+  room.followedUsers.add(userId);
+  saveRooms();
+  return awardPoints(room, body, 5, 'follow');
+}
+
+function handleLikes(room, body) {
+  const userId = normalizeUserId(body);
+  if (!userId) {
+    return { ok: false, error: 'missing_user' };
+  }
+
+  const rawLikeCount = Number(body.likeCount || 0);
+  const rawTotalLikeCount = Number(body.totalLikeCount || 0);
+
+  let deltaLikes = 0;
+  if (Number.isFinite(rawTotalLikeCount) && rawTotalLikeCount > 0) {
+    const previousTotal = Number(room.lastLikeTotal.get(userId) || 0);
+    deltaLikes = Math.max(0, rawTotalLikeCount - previousTotal);
+    room.lastLikeTotal.set(userId, rawTotalLikeCount);
+  } else {
+    deltaLikes = Math.max(0, rawLikeCount);
+  }
+
+  saveRooms();
+
+  if (deltaLikes <= 0) {
+    return { ok: true, skipped: 'no_new_likes' };
+  }
+
+  const currentBucket = Number(room.likeBuckets.get(userId) || 0) + deltaLikes;
+  const pointsToAward = Math.floor(currentBucket / 30);
+  const remainder = currentBucket % 30;
+
+  room.likeBuckets.set(userId, remainder);
+  saveRooms();
+
+  if (pointsToAward <= 0) {
+    return { ok: true, bufferedLikes: remainder };
+  }
+
+  return awardPoints(room, body, pointsToAward, 'like', {
+    likeCount: rawLikeCount,
+    totalLikeCount: rawTotalLikeCount,
+  });
+}
+
+function handleGift(room, body) {
+  const coins = Math.floor(Number(body.coins || 0));
+  if (coins <= 0) {
+    return { ok: false, error: 'bad_coins' };
+  }
+
+  return awardPoints(room, body, coins, 'gift', {
+    coins,
+    giftId: normalizeString(body.giftId),
+    giftName: normalizeString(body.giftName),
+    repeatCount: Math.max(1, Math.floor(Number(body.repeatCount || 1))),
+  });
 }
 
 function requireSecret(req, res) {
-  const secret = String(req.body?.secret || req.query?.secret || '');
-  if (secret !== API_SECRET) {
-    res.status(403).json({ ok: false, error: 'Invalid secret' });
+  const secret = normalizeString(req.body?.secret || req.query?.secret);
+  if (!secret || secret !== API_SECRET) {
+    res.status(403).json({ ok: false, error: 'invalid_secret' });
     return false;
   }
   return true;
 }
 
-app.post('/api/room/link', async (req, res) => {
-  if (!requireSecret(req, res)) return;
+app.get('/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'tikfinity-streamerbot-roblox-bridge',
+    rooms: rooms.size,
+    flagCount: FLAG_COUNT,
+  });
+});
 
-  const roomCode = normalizeRoomCode(req.body?.roomCode);
-  const username = normalizeUsername(req.body?.username);
-
-  if (!roomCode) {
-    return res.status(400).json({ ok: false, error: 'Missing roomCode' });
+app.post('/api/streamerbot/event', (req, res) => {
+  if (!requireSecret(req, res)) {
+    return;
   }
 
-  if (!username) {
-    return res.status(400).json({ ok: false, error: 'Missing username' });
+  const roomCode = normalizeString(req.body.roomCode).toUpperCase();
+  if (!roomCode) {
+    return res.status(400).json({ ok: false, error: 'missing_roomCode' });
   }
 
   const room = getRoom(roomCode);
   if (!room) {
-    return res.status(400).json({ ok: false, error: 'Invalid roomCode' });
+    return res.status(400).json({ ok: false, error: 'bad_roomCode' });
   }
+
+  const eventType = normalizeString(req.body.eventType).toLowerCase();
+  let result;
 
   try {
-    const result = await connectRoomToTikTok(room, username);
-    return res.json(result);
+    switch (eventType) {
+      case 'joinflag':
+        result = handleJoinFlag(room, req.body);
+        break;
+      case 'follow':
+        result = handleFollow(room, req.body);
+        break;
+      case 'likes':
+        result = handleLikes(room, req.body);
+        break;
+      case 'gift':
+        result = handleGift(room, req.body);
+        break;
+      default:
+        return res.status(400).json({ ok: false, error: 'unknown_eventType' });
+    }
+
+    saveRooms();
+    return res.json({
+      ok: true,
+      roomCode,
+      latestEventId: room.nextEventId - 1,
+      eventsInRoom: room.events.length,
+      result,
+    });
   } catch (err) {
-    const message = String(err?.message || err);
-    return res.status(500).json({ ok: false, error: message });
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    });
   }
-});
-
-app.post('/api/room/unlink', (req, res) => {
-  if (!requireSecret(req, res)) return;
-
-  const roomCode = normalizeRoomCode(req.body?.roomCode);
-  if (!roomCode) {
-    return res.status(400).json({ ok: false, error: 'Missing roomCode' });
-  }
-
-  const room = getRoom(roomCode);
-  disconnectRoom(room);
-  room.linkedUsername = '';
-  room.lastError = '';
-  room.updatedAt = nowMs();
-
-  return res.json({ ok: true, roomCode, disconnected: true });
-});
-
-app.get('/api/room/status', (req, res) => {
-  if (!requireSecret(req, res)) return;
-
-  const roomCode = normalizeRoomCode(req.query?.roomCode);
-  if (!roomCode) {
-    return res.status(400).json({ ok: false, error: 'Missing roomCode' });
-  }
-
-  const room = getRoom(roomCode);
-  return res.json({
-    ok: true,
-    roomCode,
-    connected: room.connected,
-    connecting: room.connecting,
-    username: room.linkedUsername || '',
-    lastError: room.lastError || '',
-    latestEventId: room.nextEventId - 1,
-    eventsInRoom: room.events.length,
-  });
 });
 
 app.get('/api/events', (req, res) => {
-  if (!requireSecret(req, res)) return;
-
-  const roomCode = normalizeRoomCode(req.query?.roomCode);
-  const lastEventId = Number(req.query?.lastEventId || 0);
-
-  if (!roomCode) {
-    return res.status(400).json({ ok: false, error: 'Missing roomCode' });
+  if (!requireSecret(req, res)) {
+    return;
   }
 
+  const roomCode = normalizeString(req.query.roomCode).toUpperCase();
   const room = getRoom(roomCode);
+  if (!room) {
+    return res.status(400).json({ ok: false, error: 'missing_roomCode' });
+  }
+
+  const lastEventId = Math.max(0, Math.floor(Number(req.query.lastEventId || 0)));
   const events = room.events.filter((event) => event.id > lastEventId);
 
-  return res.json({
+  res.json({
     ok: true,
     roomCode,
-    latestEventId: room.nextEventId - 1,
+    latestEventId: room.events.length ? room.events[room.events.length - 1].id : lastEventId,
     events,
   });
 });
 
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+app.get('*', (req, res, next) => {
+  const publicIndex = path.join(__dirname, 'public', 'index.html');
+  if (req.path === '/' && fs.existsSync(publicIndex)) {
+    return res.sendFile(publicIndex);
+  }
+  return next();
 });
 
+loadRooms();
+setInterval(cleanupRooms, 60 * 1000);
+
 app.listen(PORT, () => {
-  console.log(`TikTok old bridge listening on port ${PORT}`);
+  console.log(`TikFinity/Streamer.bot bridge listening on port ${PORT}`);
 });
