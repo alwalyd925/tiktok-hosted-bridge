@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
@@ -13,8 +14,9 @@ const API_SECRET = process.env.API_SECRET || 'roblox_tiktok_easy_bridge_v1';
 const FLAG_COUNT = Number(process.env.FLAG_COUNT || 23);
 const MAX_EVENTS_PER_ROOM = 3000;
 const INACTIVE_ROOM_MS = 1000 * 60 * 60 * 6; // 6 hours
+const DATA_FILE = path.join(__dirname, 'rooms-data.json');
 
-const rooms = new Map();
+let rooms = new Map();
 
 function nowMs() {
   return Date.now();
@@ -27,11 +29,68 @@ function makeRoom(roomCode) {
     updatedAt: nowMs(),
     nextEventId: 1,
     events: [],
-    userFlags: new Map(),      // userId -> flagNumber
-    lastLikeTotal: new Map(),  // userId -> total likes seen
-    likeBuckets: new Map(),    // userId -> leftover likes not yet converted to points
-    followedUsers: new Set(),  // userIds already rewarded for follow
+    userFlags: new Map(),
+    lastLikeTotal: new Map(),
+    likeBuckets: new Map(),
+    followedUsers: new Set(),
   };
+}
+
+function serializeRoom(room) {
+  return {
+    roomCode: room.roomCode,
+    createdAt: room.createdAt,
+    updatedAt: room.updatedAt,
+    nextEventId: room.nextEventId,
+    events: room.events,
+    userFlags: Array.from(room.userFlags.entries()),
+    lastLikeTotal: Array.from(room.lastLikeTotal.entries()),
+    likeBuckets: Array.from(room.likeBuckets.entries()),
+    followedUsers: Array.from(room.followedUsers.values()),
+  };
+}
+
+function deserializeRoom(raw) {
+  return {
+    roomCode: raw.roomCode,
+    createdAt: Number(raw.createdAt || nowMs()),
+    updatedAt: Number(raw.updatedAt || nowMs()),
+    nextEventId: Number(raw.nextEventId || 1),
+    events: Array.isArray(raw.events) ? raw.events : [],
+    userFlags: new Map(Array.isArray(raw.userFlags) ? raw.userFlags : []),
+    lastLikeTotal: new Map(Array.isArray(raw.lastLikeTotal) ? raw.lastLikeTotal : []),
+    likeBuckets: new Map(Array.isArray(raw.likeBuckets) ? raw.likeBuckets : []),
+    followedUsers: new Set(Array.isArray(raw.followedUsers) ? raw.followedUsers : []),
+  };
+}
+
+function saveRooms() {
+  try {
+    const payload = {
+      savedAt: nowMs(),
+      rooms: Array.from(rooms.entries()).map(([roomCode, room]) => [roomCode, serializeRoom(room)]),
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(payload), 'utf8');
+  } catch (err) {
+    console.error('saveRooms failed:', err);
+  }
+}
+
+function loadRooms() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) {
+      return;
+    }
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const nextRooms = new Map();
+    for (const [roomCode, rawRoom] of Array.isArray(parsed.rooms) ? parsed.rooms : []) {
+      nextRooms.set(roomCode, deserializeRoom(rawRoom));
+    }
+    rooms = nextRooms;
+    console.log(`Loaded ${rooms.size} room(s) from disk`);
+  } catch (err) {
+    console.error('loadRooms failed:', err);
+  }
 }
 
 function getRoom(roomCode) {
@@ -44,17 +103,24 @@ function getRoom(roomCode) {
   if (!room) {
     room = makeRoom(normalized);
     rooms.set(normalized, room);
+    saveRooms();
   }
+
   room.updatedAt = nowMs();
   return room;
 }
 
 function cleanupRooms() {
   const cutoff = nowMs() - INACTIVE_ROOM_MS;
+  let changed = false;
   for (const [roomCode, room] of rooms.entries()) {
     if (room.updatedAt < cutoff) {
       rooms.delete(roomCode);
+      changed = true;
     }
+  }
+  if (changed) {
+    saveRooms();
   }
 }
 
@@ -71,6 +137,7 @@ function pushEvent(room, event) {
   }
 
   room.updatedAt = nowMs();
+  saveRooms();
   return finalEvent;
 }
 
@@ -134,6 +201,7 @@ function handleJoinFlag(room, body) {
 
   room.userFlags.set(userId, flagNumber);
   room.updatedAt = nowMs();
+  saveRooms();
 
   pushEvent(room, {
     type: 'joinFlag',
@@ -157,6 +225,7 @@ function handleFollow(room, body) {
   }
 
   room.followedUsers.add(userId);
+  saveRooms();
   return awardPoints(room, body, 5, 'follow');
 }
 
@@ -178,6 +247,8 @@ function handleLikes(room, body) {
     deltaLikes = Math.max(0, rawLikeCount);
   }
 
+  saveRooms();
+
   if (deltaLikes <= 0) {
     return { ok: true, skipped: 'no_new_likes' };
   }
@@ -187,6 +258,7 @@ function handleLikes(room, body) {
   const remainder = currentBucket % 30;
 
   room.likeBuckets.set(userId, remainder);
+  saveRooms();
 
   if (pointsToAward <= 0) {
     return { ok: true, bufferedLikes: remainder };
@@ -266,10 +338,12 @@ app.post('/api/streamerbot/event', (req, res) => {
         return res.status(400).json({ ok: false, error: 'unknown_eventType' });
     }
 
-    room.updatedAt = nowMs();
+    saveRooms();
     return res.json({
       ok: true,
       roomCode,
+      latestEventId: room.nextEventId - 1,
+      eventsInRoom: room.events.length,
       result,
     });
   } catch (err) {
@@ -304,12 +378,13 @@ app.get('/api/events', (req, res) => {
 
 app.get('*', (req, res, next) => {
   const publicIndex = path.join(__dirname, 'public', 'index.html');
-  if (req.path === '/' && require('fs').existsSync(publicIndex)) {
+  if (req.path === '/' && fs.existsSync(publicIndex)) {
     return res.sendFile(publicIndex);
   }
   return next();
 });
 
+loadRooms();
 setInterval(cleanupRooms, 60 * 1000);
 
 app.listen(PORT, () => {
