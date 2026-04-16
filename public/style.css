@@ -1,0 +1,83 @@
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: linear-gradient(135deg, #03163d, #061b54);
+  color: #fff;
+}
+
+.wrap {
+  max-width: 760px;
+  margin: 48px auto;
+  padding: 0 16px;
+}
+
+.card {
+  background: rgba(6, 18, 58, 0.92);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 24px;
+  padding: 28px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.28);
+  margin-bottom: 24px;
+}
+
+.card.small {
+  padding-top: 16px;
+}
+
+h1, h2 {
+  margin-top: 0;
+}
+
+.sub {
+  color: #c7d8ff;
+  line-height: 1.8;
+}
+
+label {
+  display: block;
+  margin: 18px 0 8px;
+  font-weight: bold;
+}
+
+input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: #07112e;
+  color: #fff;
+  font-size: 18px;
+}
+
+.buttons {
+  display: flex;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+button {
+  border: 0;
+  border-radius: 14px;
+  padding: 14px 18px;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  background: #22c55e;
+  color: #fff;
+}
+
+button.secondary {
+  background: #64748b;
+}
+
+.status {
+  margin-top: 18px;
+  min-height: 24px;
+  font-size: 18px;
+}
+
+ol {
+  line-height: 2;
+  color: #dce7ff;
+}
